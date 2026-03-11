@@ -1,40 +1,34 @@
-# Light
+# Boiling Matter
 
-This example creates a Color Temperature Light device using the ESP
-Matter data model.
+This creates a DS20B18 temperature sensing device from a ESP32-C6
+board for battery-powered sensing operation configured with Matter
+over Thread.
 
 See the [docs](https://docs.espressif.com/projects/esp-matter/en/latest/esp32/developing.html) for more information about building and flashing the firmware.
 
-## 1. Additional Environment Setup
+## Basic setup
 
-No additional setup is required.
+Pull the `esp-idf` and `esp-matter` submodules and install them according
+to the instructions in their programming guides. The development environment
+can then be setup using
 
-## 2. Post Commissioning Setup
+```bash
+. esp-idf/export.sh
+. esp-matter/export.sh
+```
 
-No additional setup is required.
+Generate the configuration with
 
-## 3. Device Performance
+```bash
+idf.py set-target esp32c6
+```
 
-### 3.1 Memory usage
+Build, flash and monitor the device with
 
-The following is the Memory and Flash Usage.
+```bash
+idf.py flash monitor
+```
 
--   `Bootup` == Device just finished booting up. Device is not
-    commissionined or connected to wifi yet.
--   `After Commissioning` == Device is conneted to wifi and is also
-    commissioned and is rebooted.
--   device used: esp32c3_devkit_m
--   tested on:
-    [6a244a7](https://github.com/espressif/esp-matter/commit/6a244a7b1e5c70b0aa1bf57254f19718b0755d95)
-    (2022-06-16)
+The device can be commissioned by scanning using the test qr code in the
+`esp-matter` programming guide.
 
-|                         | Bootup | After Commissioning |
-|:-                       |:-:     |:-:                  |
-|**Free Internal Memory** |108KB   |105KB                |
-
-**Flash Usage**: Firmware binary size: 1.26MB
-
-This should give you a good idea about the amount of free memory that is
-available for you to run your application's code.
-
-Applications that do not require BLE post commissioning, can disable it using app_ble_disable() once commissioning is complete. It is not done explicitly because of a known issue with esp32c3 and will be fixed with the next IDF release (v4.4.2).

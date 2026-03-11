@@ -1,0 +1,9 @@
+
+# Ignore build artifacts and other generated files
+.cache/
+build/
+managed_components/
+
+# Ignore SDK configuration files
+sdkconfig
+sdkconfig.old
