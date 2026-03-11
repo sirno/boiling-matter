@@ -15,6 +15,7 @@ static const char *TAG = "app_driver";
 #define ONEWIRE_MAX_DS18B20 1
 
 #define VOLTAGE_READ_PIN (static_cast<adc_channel_t>(CONFIG_VOLTAGE_READ_PIN))
+#define VOLTAGE_SMOOTHING_WINDOW_SIZE 10
 
 #define ADC_ATTEN ADC_ATTEN_DB_12
 #define ADC1_CHAN0 ADC_CHANNEL_0
@@ -26,20 +27,24 @@ static adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t voltage_handle;
 static esp_timer_handle_t timer;
 
-static float voltage_window[5] = {0};
+static float voltage_window[VOLTAGE_SMOOTHING_WINDOW_SIZE] = {0};
 static int voltage_window_index = 0;
 
 static float smooth_voltage(float voltage) {
   voltage_window[voltage_window_index] = voltage;
-  voltage_window_index = (voltage_window_index + 1) % 5;
+  voltage_window_index = (voltage_window_index + 1) % VOLTAGE_SMOOTHING_WINDOW_SIZE;
 
   int count = 0;
   float sum = 0;
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < VOLTAGE_SMOOTHING_WINDOW_SIZE; i++) {
     if (voltage_window[i] > 0) {
       sum += voltage_window[i];
       count++;
     }
+  }
+
+  if (count == 0) {
+    return voltage;
   }
 
   return sum / count;
