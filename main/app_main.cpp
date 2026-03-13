@@ -116,7 +116,7 @@ static float voltage_to_percentage(float voltage) {
     return percentage_levels[num_levels - 1];
   }
 
-  float percentage = percentage_levels[i] + (percentage_levels[i + 1] - percentage_levels[i]) * (voltage - voltage_levels[i]) / (voltage_levels[i + 1] - voltage_levels[i]);
+  float percentage = percentage_levels[i] + (percentage_levels[i] - percentage_levels[i - 1]) * (voltage - voltage_levels[i]) / (voltage_levels[i] - voltage_levels[i - 1]);
 
   return percentage;
 }
