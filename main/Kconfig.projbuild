@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "Boiling Matter Configuration"
 
     config ENABLE_MEMORY_PROFILING
         bool "Enable Memory Profiling"
@@ -24,6 +24,20 @@ menu "Example Configuration"
         default 10000
         help
             Interval in milliseconds for reading sensor data.
+
+    config USE_WINDOW_FOR_VOLTAGE_SMOOTHING
+        bool "Use Window for Voltage Smoothing"
+        default n
+        help
+            Enable this option to use a window-based approach for smoothing voltage readings.
+            This can help reduce noise in the voltage measurements.
+
+    config USE_EMA_FOR_VOLTAGE_SMOOTHING
+        bool "Use EMA for Voltage Smoothing"
+        default y
+        help
+            Enable this option to use an Exponential Moving Average (EMA) for smoothing voltage readings.
+            This method gives more weight to recent readings, which can help in tracking changes in voltage more effectively.
 
 endmenu
 
