@@ -94,3 +94,9 @@ CONFIG_SENSOR_READ_INTERVAL=30000
 # WARN also compiles out CHIP progress/detail logs (CHIP follows LOG_DEFAULT_LEVEL).
 # Switch to INFO in menuconfig when debugging.
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+# The built-in USB-Serial-JTAG port detaches from the host on every light sleep, which ends
+# `idf.py monitor` ("Device not configured"). Stay out of automatic light sleep while a USB host is
+# connected to that port. Without a host (on battery, or a power-only charger) the device sleeps
+# normally.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
