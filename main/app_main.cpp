@@ -6,6 +6,10 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+
 #include <esp_err.h>
 #include <esp_log.h>
 #include <nvs_flash.h>
@@ -55,21 +59,45 @@ static const char *s_decryption_key = decryption_key_start;
 static const uint16_t s_decryption_key_len = decryption_key_end - decryption_key_start;
 #endif // CONFIG_ENABLE_ENCRYPTED_OTA
 
+// DS18B20 measurement range, in MeasuredValue units.
+constexpr int16_t k_min_measured_temperature = -5500;
+constexpr int16_t k_max_measured_temperature = 12500;
+// Upper bound of the BatVoltage attribute (mV). Readings above it are clamped rather than
+// rejected by the attribute bounds check.
+constexpr uint32_t k_bat_voltage_max_mv = 5000;
+
 // Application cluster specification, 7.18.2.11. Temperature
 // represents a temperature on the Celsius scale with a resolution of 0.01°C.
 // temp = (temperature in °C) x 100
+//
+// MeasuredValue is only written when the temperature moves at least
+// CONFIG_TEMPERATURE_REPORT_DEADBAND away from the last written value. Every write triggers a
+// subscription report, and every report keeps this ICD in fast-poll active mode for
+// ActiveModeThreshold. Comparing against the last written value (not the last sample) means
+// slow drifts are still reported. NAN (sensor unreadable) sets MeasuredValue to null.
 static void temp_sensor_notification(uint16_t endpoint_id, float temp, void *user_data) {
+  const bool valid = !std::isnan(temp);
+  const int16_t centi_celsius = valid ? static_cast<int16_t>(std::lround(temp * 100.0f)) : 0;
+
   // schedule the attribute update so that we can report it from matter thread
-  chip::DeviceLayer::SystemLayer().ScheduleLambda([endpoint_id, temp]() {
-    attribute_t *attribute = attribute::get(endpoint_id, TemperatureMeasurement::Id,
-                                            TemperatureMeasurement::Attributes::MeasuredValue::Id);
+  chip::DeviceLayer::SystemLayer().ScheduleLambda([endpoint_id, valid, centi_celsius]() {
+    // Only accessed from the Matter thread. s_has_value is false while MeasuredValue is null.
+    static bool s_has_value = false;
+    static int16_t s_last_written = 0;
 
-    esp_matter_attr_val_t val = esp_matter_invalid(NULL);
-    attribute::get_val(attribute, &val);
-    val.val.u16 = static_cast<uint16_t>(temp * 100);
+    if (valid && s_has_value && std::abs(centi_celsius - s_last_written) < CONFIG_TEMPERATURE_REPORT_DEADBAND) {
+      return;
+    }
+    if (!valid && !s_has_value) {
+      return;
+    }
 
+    esp_matter_attr_val_t val =
+        esp_matter_nullable_int16(valid ? nullable<int16_t>(centi_celsius) : nullable<int16_t>());
     attribute::update(endpoint_id, TemperatureMeasurement::Id,
                       TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
+    s_has_value = valid;
+    s_last_written = centi_celsius;
   });
 }
 
@@ -121,40 +149,77 @@ static float voltage_to_percentage(float voltage) {
   return percentage;
 }
 
-// Application cluster specification, 7.11.7. Battery Voltage
-// represents a voltage with a resolution of 0.01V.
-static void battery_voltage_notification(uint16_t endpoint_id, float voltage, void *user_data) {
-  float charge_percentage = voltage_to_percentage(voltage / 1000.0);
-  float charge_level = charge_percentage * 2.0;
+// BatChargeLevel thresholds, in percent of charge.
+constexpr float k_battery_warning_percent = 20.0f;
+constexpr float k_battery_critical_percent = 5.0f;
+// A lower charge level is only left once the charge is this far back above its threshold, so
+// readings hovering around a threshold don't flip the level back and forth.
+constexpr float k_battery_level_hysteresis_percent = 2.0f;
 
-  if (charge_level < 0) {
-    charge_level = 0.0;
-  } else if (charge_level > 200) {
-    charge_level = 200.0;
+static uint8_t next_charge_level(float percent, uint8_t previous) {
+  const uint8_t ok = chip::to_underlying(PowerSource::BatChargeLevelEnum::kOk);
+  const uint8_t warning = chip::to_underlying(PowerSource::BatChargeLevelEnum::kWarning);
+  const uint8_t critical = chip::to_underlying(PowerSource::BatChargeLevelEnum::kCritical);
+
+  const float critical_below =
+      k_battery_critical_percent + (previous == critical ? k_battery_level_hysteresis_percent : 0.0f);
+  const float warning_below =
+      k_battery_warning_percent + (previous != ok ? k_battery_level_hysteresis_percent : 0.0f);
+
+  if (percent < critical_below) {
+    return critical;
+  }
+  if (percent < warning_below) {
+    return warning;
+  }
+  return ok;
+}
+
+// Application cluster specification, 11.7.7. BatVoltage (mV), BatPercentRemaining (0.5 % steps)
+// and BatChargeLevel.
+//
+// The attributes are only written when BatPercentRemaining moves by at least
+// CONFIG_BATTERY_REPORT_DEADBAND steps or BatChargeLevel changes. BatVoltage has the Changes
+// Omitted (C) quality, so its changes alone must not drive reports: it is only written together
+// with the other two.
+static void battery_voltage_notification(uint16_t endpoint_id, float voltage, void *user_data) {
+  if (std::isnan(voltage)) {
+    return;
   }
 
-  ESP_LOGI(TAG, "Battery voltage: %.2f V, charge level: %.2f%%", voltage / 1000.0, charge_percentage * 100);
+  const float percent = voltage_to_percentage(voltage / 1000.0f);
+  const uint8_t half_percent = static_cast<uint8_t>(std::lround(std::clamp(percent * 2.0f, 0.0f, 200.0f)));
+  const uint32_t millivolts = static_cast<uint32_t>(
+      std::lround(std::clamp(voltage, 0.0f, static_cast<float>(k_bat_voltage_max_mv))));
+
+  ESP_LOGI(TAG, "Battery voltage: %.3f V, charge: %.1f%%", voltage / 1000.0f, percent);
 
   // schedule the attribute update so that we can report it from matter thread
-  chip::DeviceLayer::SystemLayer().ScheduleLambda([endpoint_id, voltage, charge_level]() {
-    // battery voltage
-    attribute_t *attribute_bat_voltage = attribute::get(endpoint_id, PowerSource::Id,
-                                            PowerSource::Attributes::BatVoltage::Id);
-    esp_matter_attr_val_t val = esp_matter_invalid(NULL);
-    attribute::get_val(attribute_bat_voltage, &val);
-    val.val.u32 = static_cast<uint32_t>(voltage);
+  chip::DeviceLayer::SystemLayer().ScheduleLambda([endpoint_id, percent, half_percent, millivolts]() {
+    // Only accessed from the Matter thread.
+    static bool s_has_value = false;
+    static uint8_t s_last_half_percent = 0;
+    static uint8_t s_last_level = chip::to_underlying(PowerSource::BatChargeLevelEnum::kOk);
 
-    attribute::update(endpoint_id, PowerSource::Id, PowerSource::Attributes::BatVoltage::Id, &val);
+    const uint8_t level = next_charge_level(percent, s_last_level);
+    const bool percent_moved =
+        !s_has_value || std::abs(half_percent - s_last_half_percent) >= CONFIG_BATTERY_REPORT_DEADBAND;
+    if (!percent_moved && level == s_last_level) {
+      return;
+    }
 
-    // battery charge percentage
-    attribute_t *attribute_charge_percentage = attribute::get(endpoint_id, PowerSource::Id,
-                                            PowerSource::Attributes::BatPercentRemaining::Id);
+    esp_matter_attr_val_t bat_voltage = esp_matter_nullable_uint32(nullable<uint32_t>(millivolts));
+    attribute::update(endpoint_id, PowerSource::Id, PowerSource::Attributes::BatVoltage::Id, &bat_voltage);
 
-    esp_matter_attr_val_t charge_percentage_val = esp_matter_invalid(NULL);
-    attribute::get_val(attribute_charge_percentage, &charge_percentage_val);
-    charge_percentage_val.val.u8 = static_cast<uint8_t>(charge_level);
+    esp_matter_attr_val_t remaining = esp_matter_nullable_uint8(nullable<uint8_t>(half_percent));
+    attribute::update(endpoint_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &remaining);
 
-    attribute::update(endpoint_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &charge_percentage_val);
+    esp_matter_attr_val_t charge_level = esp_matter_enum8(level);
+    attribute::update(endpoint_id, PowerSource::Id, PowerSource::Attributes::BatChargeLevel::Id, &charge_level);
+
+    s_has_value = true;
+    s_last_half_percent = half_percent;
+    s_last_level = level;
   });
 }
 
@@ -244,18 +309,20 @@ static esp_err_t app_identification_cb(identification::callback_type_t type, uin
 static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16_t endpoint_id, uint32_t cluster_id,
                                          uint32_t attribute_id, esp_matter_attr_val_t *val, void *priv_data)
 {
+    // Debug level only: these fire on every attribute update, and console output busy-waits
+    // the CPU while the UART drains.
     switch (type) {
       case PRE_UPDATE:
-          ESP_LOGI(TAG, "Attribute pre_update callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
+          ESP_LOGD(TAG, "Attribute pre_update callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
           break;
       case POST_UPDATE:
-          ESP_LOGI(TAG, "Attribute post_update callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
+          ESP_LOGD(TAG, "Attribute post_update callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
           break;
       case READ:
-          ESP_LOGI(TAG, "Attribute read callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
+          ESP_LOGD(TAG, "Attribute read callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
           break;
       case WRITE:
-          ESP_LOGI(TAG, "Attribute write callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
+          ESP_LOGD(TAG, "Attribute write callback: endpoint: %u, cluster: %u, attribute: %u", endpoint_id, cluster_id, attribute_id);
           break;
     }
 
@@ -278,6 +345,8 @@ extern "C" void app_main()
 
     // add temperature sensor device endpoint
     temperature_sensor::config_t temp_sensor_config;
+    temp_sensor_config.temperature_measurement.min_measured_value = nullable<int16_t>(k_min_measured_temperature);
+    temp_sensor_config.temperature_measurement.max_measured_value = nullable<int16_t>(k_max_measured_temperature);
     endpoint_t *temp_sensor_ep =
         temperature_sensor::create(node, &temp_sensor_config, ENDPOINT_FLAG_NONE, NULL);
     ABORT_APP_ON_FAILURE(temp_sensor_ep != nullptr,
@@ -286,36 +355,25 @@ extern "C" void app_main()
     // add power source cluster
     esp_matter::cluster::power_source::config_t power_source_config;
     power_source_config.feature_flags = esp_matter::cluster::power_source::feature::battery::get_id();
-    endpoint_t *power_source_cluster = esp_matter::cluster::power_source::create(temp_sensor_ep, &power_source_config, CLUSTER_FLAG_SERVER);
+    cluster_t *power_source_cluster = esp_matter::cluster::power_source::create(temp_sensor_ep, &power_source_config, CLUSTER_FLAG_SERVER);
     ABORT_APP_ON_FAILURE(power_source_cluster != nullptr,
-                         ESP_LOGE(TAG, "Failed to create power_source endpoint"));
+                         ESP_LOGE(TAG, "Failed to create power_source cluster"));
 
-    // add battery voltage attribute to cluster
+    // Battery voltage (mV) and percentage (0.5 % steps) start as null (unknown) until the first
+    // battery sample, so controllers don't show an empty battery right after boot.
     esp_matter::cluster::power_source::attribute::create_bat_voltage
-      (power_source_cluster, nullable<uint32_t>(0), nullable<uint32_t>(0), nullable<uint32_t>(4200));
-    // esp_matter::cluster::power_source::attribute::create_bat_charge_level(power_source_cluster, 0);
-    esp_matter::cluster::power_source::attribute::create_bat_percent_remaining(power_source_cluster, nullable<uint8_t>(0), nullable<uint8_t>(0), nullable<uint8_t>(255));
+      (power_source_cluster, nullable<uint32_t>(), nullable<uint32_t>(0), nullable<uint32_t>(k_bat_voltage_max_mv));
+    esp_matter::cluster::power_source::attribute::create_bat_percent_remaining(power_source_cluster, nullable<uint8_t>(), nullable<uint8_t>(0), nullable<uint8_t>(200));
 
-    // initialize temperature sensor driver (ds18b20)
-    err = init_ds18x20_devices();
+    // Sensor failures are not fatal: the device keeps running and reports what it can.
     err = init_voltage_adc();
-
-    static sensor_config_t sensor_config = {
-        .interval_ms = CONFIG_SENSOR_READ_INTERVAL,
-        .temperature = {
-            .cb = temp_sensor_notification,
-            .endpoint_id = endpoint::get_id(temp_sensor_ep),
-        },
-        .batvoltage = {
-            .cb = battery_voltage_notification,
-            .endpoint_id = endpoint::get_id(temp_sensor_ep),
-        },
-    };
-    ESP_LOGI(TAG, "Registering readouts for temperature endpoint %u", sensor_config.temperature.endpoint_id);
-    ESP_LOGI(TAG, "Registering readouts for voltage endpoint %u", sensor_config.batvoltage.endpoint_id);
-    err = init_sensor_readouts(&sensor_config);
-    ABORT_APP_ON_FAILURE(err == ESP_OK,
-                         ESP_LOGE(TAG, "Failed to initialize temperature sensor driver"));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Battery ADC unavailable (%s), battery level will not be reported", esp_err_to_name(err));
+    }
+    err = init_ds18x20_devices();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No DS18B20 found (%s), will keep scanning the bus", esp_err_to_name(err));
+    }
 
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
     /* Set OpenThread platform config */
@@ -331,15 +389,39 @@ extern "C" void app_main()
     err = esp_matter::start(app_event_cb);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
 
+    // Start sampling only once the Matter stack is up, since the callbacks post to it.
+    static sensor_config_t sensor_config = {
+        .interval_ms = CONFIG_SENSOR_READ_INTERVAL,
+        .battery_interval_ms = CONFIG_BATTERY_READ_INTERVAL_SEC * 1000U,
+        .temperature = {
+            .cb = temp_sensor_notification,
+            .endpoint_id = endpoint::get_id(temp_sensor_ep),
+        },
+        .batvoltage = {
+            .cb = battery_voltage_notification,
+            .endpoint_id = endpoint::get_id(temp_sensor_ep),
+        },
+    };
+    ESP_LOGI(TAG, "Registering readouts for temperature endpoint %u", sensor_config.temperature.endpoint_id);
+    ESP_LOGI(TAG, "Registering readouts for voltage endpoint %u", sensor_config.batvoltage.endpoint_id);
+    err = init_sensor_readouts(&sensor_config);
+    ABORT_APP_ON_FAILURE(err == ESP_OK,
+                         ESP_LOGE(TAG, "Failed to start sensor readouts"));
+
 #if CONFIG_PM_ENABLE
+    // Drop to the XTAL frequency when idle; drivers raise it through PM locks while they need it.
+    // This matches Espressif's recommended low-power configuration for the C6.
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
         .light_sleep_enable = true
 #endif
     };
     err = esp_pm_configure(&pm_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_pm_configure failed: %s", esp_err_to_name(err));
+    }
 #endif
 
 }

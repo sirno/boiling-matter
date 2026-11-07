@@ -14,16 +14,66 @@ menu "Boiling Matter Configuration"
             Default OneWire Data Pin
 
     config VOLTAGE_READ_PIN
-        int "Battery Voltage Read"
+        int "Battery Voltage Read GPIO"
+        default 1 if IDF_TARGET_ESP32H2
         default 0
         help
-            Default Voltage Input Pin
+            GPIO connected to the battery voltage divider. Must be an ADC-capable pin
+            (GPIO0-GPIO6 on the ESP32-C6, GPIO1-GPIO5 on the ESP32-H2). The defaults are
+            the pin of ADC1 channel 0 on each target.
 
     config SENSOR_READ_INTERVAL
-        int "Sensor Read Interval (ms)"
-        default 10000
+        int "Temperature Read Interval (ms)"
+        default 30000
+        range 1000 3600000
         help
-            Interval in milliseconds for reading sensor data.
+            Interval in milliseconds between temperature samples. A sample is only reported
+            to Matter when it differs from the last reported value by at least
+            TEMPERATURE_REPORT_DEADBAND.
+
+    config TEMPERATURE_REPORT_DEADBAND
+        int "Temperature Reporting Deadband (0.01 °C)"
+        default 30
+        range 0 1000
+        help
+            Minimum change, in units of 0.01 °C, from the last reported temperature before a
+            new value is reported. Every report keeps the device in fast-poll active mode for
+            the ICD active mode threshold, so this has a large effect on battery life.
+            0 reports every change.
+
+            Keep it above one sensor step (DS18B20_RESOLUTION), otherwise a reading that
+            flickers between two adjacent values reports on every flip. The default of 30
+            with 10-bit resolution (0.25 °C steps) reports changes of 0.5 °C; 11 bits with
+            a deadband of 20 reports 0.25 °C changes for about twice the sensor energy.
+
+    config DS18B20_RESOLUTION
+        int "DS18B20 Resolution (bits)"
+        default 10
+        range 9 12
+        help
+            Conversion resolution. Higher resolutions take longer, and the sensor draws about
+            1 mA while converting:
+            9 bits: 0.5 °C, 94 ms; 10 bits: 0.25 °C, 188 ms;
+            11 bits: 0.125 °C, 375 ms; 12 bits: 0.0625 °C, 750 ms.
+            The sensor's accuracy is +/-0.5 °C (-10 to +85 °C), so 10 bits is usually enough.
+
+    config BATTERY_READ_INTERVAL_SEC
+        int "Battery Read Interval (s)"
+        default 900
+        range 1 86400
+        help
+            Interval in seconds between battery voltage samples. The battery is sampled on
+            the first temperature cycle and then on every temperature cycle closest to this
+            interval, so the effective interval is a multiple of SENSOR_READ_INTERVAL.
+
+    config BATTERY_REPORT_DEADBAND
+        int "Battery Reporting Deadband (0.5 %)"
+        default 2
+        range 0 200
+        help
+            Minimum change of BatPercentRemaining, in its native 0.5 % steps, before the
+            battery attributes are reported again (2 = 1 %). BatVoltage is only updated
+            together with BatPercentRemaining or BatChargeLevel. 0 reports every sample.
 
     config USE_WINDOW_FOR_VOLTAGE_SMOOTHING
         bool "Use Window for Voltage Smoothing"
